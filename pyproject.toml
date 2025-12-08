@@ -1,0 +1,28 @@
+[project]
+name = "world-radio-prefixes"
+version = "0.1.0"
+description = "This is a maintenance tool for RCLDX that parses a world radio prefixes used in ham radio"
+authors = [{ name = "Jonathan González", email = "ea1het@ea1het.com" }]
+license = { text = "Mozilla Public License Version 2.0" }
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["python-dotenv (>=1.2.1,<2.0.0)"]
+
+[tool.poetry]
+package-mode = false
+packages = [{ include = "prefixes", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.1"
+mypy = "^1.18.2"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.semantic_release]
+branch = "main"
+version_variables = ["src/*/__init__.py:__version__"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
