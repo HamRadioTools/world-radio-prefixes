@@ -6,18 +6,16 @@
 """World Radio Prefixes - RCLDX companion software"""
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
+import argparse
 import csv
 import json
+import redis
+from config import get_config
 
-from config import get_config  # noqa: F401
-
-
-__updated__ = "2025-12-08 14:43:46"
-
+__updated__ = "2025-12-09 02:10:23"
 
 ###############################################################################
 #
@@ -53,6 +51,9 @@ DEFAULT_JSON_PATH = OUTPUT_DIR / "prefixes.json"
 _PREFIX_MAP: Optional[Dict[str, PrefixInfo]] = None
 _MAX_PREFIX_LEN: int = 0
 
+# Load config ONCE – it already pulls from env + dotenv inside config.py
+CONFIG: dict = get_config() or {}
+
 
 ###############################################################################
 #
@@ -80,7 +81,6 @@ def _resolve_columns(fieldnames: list[str]) -> dict[str, Optional[str]]:
     and values = header name in the CSV (or None if not found).
     """
 
-    # Normalizamos los nombres: quitamos BOM, espacios, bajamos a lower…
     norm = {(name or "").lstrip("\ufeff").strip().lower().replace(" ", "_"): name for name in fieldnames}
 
     def col(key: str, *alts: str) -> Optional[str]:
@@ -107,17 +107,14 @@ def load_prefix_table(
     """
     Load prefixes from the CSV file and return a mapping:
     prefix (e.g. "UA7") -> PrefixInfo.
-
-    This:
-    - Reads the main 'Prefix' column.
-    - Expands all comma-separated entries in 'Likely Prefixes'.
-    - Skips empty and '???' entries.
-    - Ensures each prefix maps to a PrefixInfo with DXCC, country, continent, CQ zone.
     """
     prefix_map: Dict[str, PrefixInfo] = {}
 
+    if not csv_path.exists():
+        print(f"[ERROR] CSV file not found at {csv_path}")
+        return prefix_map
+
     with csv_path.open(newline="", encoding="utf-8") as f:
-        # Sniffer por si cambias el delimitador en el futuro
         sample = f.read(4096)
         f.seek(0)
         try:
@@ -128,7 +125,7 @@ def load_prefix_table(
         reader = csv.DictReader(f, dialect=dialect)
 
         if not reader.fieldnames:
-            # CSV vacío o mal formado
+            print("[ERROR] prefixes.csv has no header row")
             return {}
 
         cols = _resolve_columns(reader.fieldnames)
@@ -142,7 +139,7 @@ def load_prefix_table(
         likely_col = cols["likely_prefixes"]
 
         if prefix_col is None:
-            # Sin columna Prefix no podemos hacer nada útil
+            print("[ERROR] Could not find 'Prefix' column in CSV")
             return {}
 
         for row in reader:
@@ -202,7 +199,6 @@ def get_prefix_map() -> Dict[str, PrefixInfo]:
 
 def get_max_prefix_length() -> int:
     """Return the maximum prefix length seen in the table."""
-    # Ensure the map is loaded
     get_prefix_map()
     return _MAX_PREFIX_LEN
 
@@ -214,21 +210,12 @@ def export_prefixes_json(
     """
     Export the prefix table to a JSON file suitable for
     in-memory loading or Redis insertion.
-
-    JSON structure:
-        {
-          "UA7": {
-            "name": "...",
-            "dxcc": 54,
-            "country_code": "ru",
-            "continent": "EU",
-            "cq_zones": "16"
-          },
-          ...
-        }
     """
     if prefix_map is None:
         prefix_map = get_prefix_map()
+
+    if not prefix_map:
+        print("[WARN] No prefixes loaded, JSON will be empty")
 
     payload = {
         prefix: {
@@ -242,6 +229,136 @@ def export_prefixes_json(
     }
 
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"[INFO] Exported {len(payload)} prefixes to {json_path}")
+
+
+def load_prefixes_json(json_path: Path = DEFAULT_JSON_PATH) -> Dict[str, dict]:
+    """Load the generated prefixes.json into a plain dict."""
+    if not json_path.exists():
+        print(f"[ERROR] JSON file not found at {json_path}")
+        return {}
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            print(f"[ERROR] JSON at {json_path} is not an object")
+            return {}
+        return data
+    except json.JSONDecodeError as exc:
+        print(f"[ERROR] Failed to parse JSON at {json_path}: {exc}")
+        return {}
+
+
+###############################################################################
+# REDIS HELPERS (NO DOUBLE CONFIG / ENV LOADING)
+###############################################################################
+
+
+def _get_redis_client():
+    """
+    Build and return a Redis client using CONFIG.
+
+    CONFIG comes from get_config() once, which already:
+      - loads .env (via config.py)
+      - reads environment variables
+    """
+    if redis is None:
+        print("[ERROR] redis library is not installed. Run: pip install redis")
+        return None
+
+    host = CONFIG.get("REDIS_HOST")
+    port = CONFIG.get("REDIS_PORT")
+    db = CONFIG.get("REDIS_DB")
+    password = CONFIG.get("REDIS_PASSWORD")
+
+    # Normalize port/db
+    try:
+        if isinstance(port, str):
+            port = int(port)
+    except ValueError:
+        port = None
+
+    try:
+        if isinstance(db, str):
+            db = int(db)
+    except ValueError:
+        db = None
+
+    port = port or 6379
+    db = db or 0
+
+    # Treat "none" / "" as no password
+    if isinstance(password, str) and password.lower() in ("", "none", "null"):
+        password = None
+
+    if not host:
+        print("[ERROR] Redis host not configured (REDIS_HOST in config/env)")
+        return None
+
+    try:
+        client = redis.Redis(host=host, port=port, db=db, password=password)
+        client.ping()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERROR] Could not connect to Redis at {host}:{port} db={db}: {exc}")
+        return None
+
+    print(f"[INFO] Connected to Redis at {host}:{port}/{db}")
+    return client
+
+
+def inject_prefixes_into_redis(prefixes: Dict[str, dict]) -> None:
+    """Insert all prefixes into Redis as hashes."""
+    if not prefixes:
+        print("[ERROR] No prefixes to inject into Redis")
+        return
+
+    client = _get_redis_client()
+    if client is None:
+        return
+
+    print(f"[INFO] Injecting {len(prefixes)} prefixes into Redis")
+
+    pipe = client.pipeline(transaction=False)
+    count = 0
+
+    for prefix, info in prefixes.items():
+        key = f"rcldx:prefix:{prefix}"
+        mapping = {k: ("" if v is None else str(v)) for k, v in info.items()}
+        pipe.hset(key, mapping=mapping)
+        count += 1
+        if count % 1000 == 0:
+            pipe.execute()
+
+    pipe.execute()
+    print(f"[INFO] Injected {count} prefix entries into Redis")
+
+
+def clean_local_files() -> None:
+    """Remove local generated files (currently prefixes.json)."""
+    if DEFAULT_JSON_PATH.exists():
+        DEFAULT_JSON_PATH.unlink()
+        print(f"[INFO] Removed local file {DEFAULT_JSON_PATH}")
+    else:
+        print(f"[INFO] No local prefixes.json found at {DEFAULT_JSON_PATH}; nothing to clean")
+
+
+def clean_redis_prefixes() -> None:
+    """Remove Redis keys for RCLDX prefixes (rcldx:prefix:*)."""
+    client = _get_redis_client()
+    if client is None:
+        # _get_redis_client already printed an error
+        return
+
+    pattern = "rcldx:prefix:*"
+    print(f"[INFO] Searching for keys matching '{pattern}' in Redis")
+
+    # Use SCAN to iterate keys
+    keys = list(client.scan_iter(match=pattern))
+    if not keys:
+        print(f"[INFO] No keys matching '{pattern}' found in Redis; nothing to clean")
+        return
+
+    deleted = client.delete(*keys)
+    print(f"[INFO] Deleted {deleted} Redis keys matching '{pattern}'")
 
 
 ###############################################################################
@@ -251,14 +368,60 @@ def export_prefixes_json(
 ###############################################################################
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> None:
     """
-    Main application code
-    """
+    CLI usage:
+      - No arguments: print help
+      - --parsecsv           : parse CSV and generate prefixes.json
+      - --injectredis        : load prefixes.json and inject into Redis
+      - --clean {local,redis,all} : remove local JSON, Redis keys, or both
 
-    # Simple behaviour when running: regenerate prefixes.json into ./output
-    export_prefixes_json()
-    print(f"Exported prefix table to {DEFAULT_JSON_PATH}")
+      All flags can be combined; operations run in this order:
+        1) clean
+        2) parsecsv
+        3) injectredis
+    """
+    parser = argparse.ArgumentParser(description="World Radio Prefixes - CSV to JSON and Redis injector")
+    parser.add_argument(
+        "--parsecsv",
+        action="store_true",
+        help="Parse prefixes.csv from resources and generate prefixes.json in output/",
+    )
+    parser.add_argument(
+        "--injectredis",
+        action="store_true",
+        help="Load prefixes.json from output/ and inject into Redis",
+    )
+    parser.add_argument(
+        "--clean",
+        choices=["local", "redis", "all"],
+        help="Clean generated prefixes.json, Redis prefixes, or both",
+    )
+
+    args = parser.parse_args(argv)
+
+    if not args.parsecsv and not args.injectredis and not args.clean:
+        parser.print_help()
+        return
+
+    # 1) Cleaning step
+    if args.clean:
+        if args.clean in ("local", "all"):
+            clean_local_files()
+        if args.clean in ("redis", "all"):
+            clean_redis_prefixes()
+
+    # 2) Parse CSV → JSON
+    if args.parsecsv:
+        print(f"[INFO] Parsing CSV from {CSV_PATH}")
+        prefix_map = load_prefix_table()
+        export_prefixes_json(DEFAULT_JSON_PATH, prefix_map)
+
+    # 3) JSON → Redis
+    if args.injectredis:
+        print(f"[INFO] Loading prefixes from JSON at {DEFAULT_JSON_PATH}")
+        prefixes = load_prefixes_json(DEFAULT_JSON_PATH)
+        inject_prefixes_into_redis(prefixes)
 
 
 ###############################################################################
@@ -268,4 +431,6 @@ def main() -> None:
 ###############################################################################
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    main(sys.argv[1:])

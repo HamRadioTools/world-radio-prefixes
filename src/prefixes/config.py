@@ -5,7 +5,7 @@
 
 """World Radio Prefixes - RCLDX companion software"""
 
-__updated__ = "2025-12-08 13:53:33"
+__updated__ = "2025-12-09 01:42:57"
 
 import os
 from dotenv import load_dotenv, find_dotenv
@@ -14,16 +14,6 @@ from dotenv import load_dotenv, find_dotenv
 # Load .env if present (ideal for local development).
 # In containers, if .env is missing, environment variables are used as-is.
 load_dotenv(find_dotenv())
-
-
-def str_to_bool(value: str | None, default: bool = True) -> bool:
-    """
-    Convert strings like "true"/"false"/"1"/"0" to boolean values.
-    If value is None, return the provided default.
-    """
-    if value is None:
-        return default
-    return value.lower() in ("1", "true", "yes", "y", "t")
 
 
 def get_config() -> dict:
@@ -43,8 +33,9 @@ def get_config() -> dict:
         default_log_level = "INFO"
 
     return {
-        # --- Execution mode ---
-        # - api: run the Flask API
-        # - worker: run the worker
-        "APP_TYPE": os.getenv("APP_TYPE", "none"),
+        "REDIS_HOST": os.getenv("REDIS_HOST", "localhost"),
+        "REDIS_PORT": os.getenv("REDIS_PORT", "6379"),
+        "REDIS_DB": os.getenv("REDIS_DB", "0"),
+        "REDIS_PASSWORD": os.getenv("REDIS_PASSWORD", "none"),
+        "REDIS_MAX_CONN": os.getenv("REDIS_MAX_CONN", "25"),
     }
