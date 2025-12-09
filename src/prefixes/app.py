@@ -15,7 +15,7 @@ import json
 import redis
 from config import get_config
 
-__updated__ = "2025-12-09 02:10:23"
+__updated__ = "2025-12-09 02:31:17"
 
 ###############################################################################
 #
@@ -72,7 +72,7 @@ def _parse_int(value: str) -> Optional[int]:
         return None
 
 
-def _resolve_columns(fieldnames: list[str]) -> dict[str, Optional[str]]:
+def _resolve_columns(fieldnames: List[str]) -> dict[str, Optional[str]]:
     """
     Map logical column names to real CSV headers, handling BOM and case/spacing.
 
@@ -102,12 +102,18 @@ def _resolve_columns(fieldnames: list[str]) -> dict[str, Optional[str]]:
 
 
 def load_prefix_table(
-    csv_path: Path = CSV_PATH,
+    csv_path: Optional[Path] = None,
 ) -> Dict[str, PrefixInfo]:
     """
     Load prefixes from the CSV file and return a mapping:
     prefix (e.g. "UA7") -> PrefixInfo.
+
+    If csv_path is None, use the module-level CSV_PATH, which can be
+    monkeypatched in tests.
     """
+    if csv_path is None:
+        csv_path = CSV_PATH
+
     prefix_map: Dict[str, PrefixInfo] = {}
 
     if not csv_path.exists():
@@ -249,7 +255,7 @@ def load_prefixes_json(json_path: Path = DEFAULT_JSON_PATH) -> Dict[str, dict]:
 
 
 ###############################################################################
-# REDIS HELPERS (NO DOUBLE CONFIG / ENV LOADING)
+# REDIS HELPERS
 ###############################################################################
 
 
@@ -322,6 +328,7 @@ def inject_prefixes_into_redis(prefixes: Dict[str, dict]) -> None:
 
     for prefix, info in prefixes.items():
         key = f"rcldx:prefix:{prefix}"
+        # Convert None to "" and ensure all values are strings
         mapping = {k: ("" if v is None else str(v)) for k, v in info.items()}
         pipe.hset(key, mapping=mapping)
         count += 1
@@ -345,13 +352,11 @@ def clean_redis_prefixes() -> None:
     """Remove Redis keys for RCLDX prefixes (rcldx:prefix:*)."""
     client = _get_redis_client()
     if client is None:
-        # _get_redis_client already printed an error
         return
 
     pattern = "rcldx:prefix:*"
     print(f"[INFO] Searching for keys matching '{pattern}' in Redis")
 
-    # Use SCAN to iterate keys
     keys = list(client.scan_iter(match=pattern))
     if not keys:
         print(f"[INFO] No keys matching '{pattern}' found in Redis; nothing to clean")
@@ -368,7 +373,7 @@ def clean_redis_prefixes() -> None:
 ###############################################################################
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """
     CLI usage:
       - No arguments: print help
